@@ -28,6 +28,7 @@
 #include <iomanip>
 #include <cstdlib>
 #include <regex>
+#include <stack>
 #include <functional>
 #include <map>
 #include <set>
@@ -57,6 +58,8 @@
 #else
     static const char *EXE_EXT = "";
 #endif
+
+
 
 // Quote a program path for system().  On POSIX the shell searches $PATH
 // only -- never the current directory -- so a bare name like "hello" is
@@ -227,7 +230,13 @@ static bool hasSupportedExt(const std::string &path)
     return ext == ".sa" || ext == ".js" || ext == ".py" ||
            ext == ".rb" || ext == ".c" || ext == ".cpp";
 }
+static bool endsWith(const std::string &str, const std::string &suffix)
+{
+    if (str.length() < suffix.length())
+        return false;
 
+    return str.compare(str.length() - suffix.length(), suffix.length(), suffix) == 0;
+}
 // True if the source defines a function named main ("main" followed by "(",
 // not part of a longer identifier).
 static bool definesMainFunction(const std::string &src)
@@ -276,14 +285,17 @@ static bool startsWith(const std::string &value, const std::string &prefix)
 //   unless condition      -> if (!(condition))
 //   while/until/end       -> brace-based loops
 //   def name(args)/end    -> function name(args) { ... }
+
+
 static std::string applyRubyDialect(const std::string &source)
 {
     std::istringstream input(source);
     std::ostringstream output;
     std::string line;
-
+    std::stack<std::string> rubyBlocks;
     while (std::getline(input, line))
     {
+
         size_t first = line.find_first_not_of(" \t");
         if (first == std::string::npos)
         {
@@ -293,13 +305,92 @@ static std::string applyRubyDialect(const std::string &source)
 
         std::string indentation = line.substr(0, first);
         std::string code = trimCopy(line.substr(first));
+// Special-case: File.exist? maps to File.exist (no suffix) in this VM
+{
+    static const std::regex fileExistRegex(R"(File\.exist\?)");
+    code = std::regex_replace(code, fileExistRegex, "File.exist");
+}
 
+// Ruby instance variables: @name -> this.name
+{
+    static const std::regex ivarRegex(R"(@([A-Za-z_]\w*))");
+    code = std::regex_replace(code, ivarRegex, "this.$1");
+}
         // Full-line Ruby comments. Inline # comments are left unchanged so a
         // # inside a string or interpolation-like text is never corrupted.
         if (!code.empty() && code[0] == '#')
         {
             output << indentation << "//" << code.substr(1) << "\n";
             continue;
+        }
+if (!rubyBlocks.empty() && rubyBlocks.top() == "rescue_dead" && code != "end")
+{
+    output << indentation << "// " << code << "\n";
+    continue;
+}
+        // Ruby predicate/bang method calls: prime?(n), word.palindrome?,
+        // b.zero?, File.exist?(filename), (2..n).none? { |i| ... }
+        // Renames name? -> name_q and name! -> name_bang, everywhere they
+        // appear on this line (including inside #{...} interpolation and
+        // right before an inline `{ |x| ... }` block). If there was no
+        // trailing '(' already, one is added (and closed) so it becomes a
+        //valod call
+        {
+    static const std::regex predicateCallRegex(R"(([A-Za-z_]\w*)([?!])(\s*\()?)");
+    std::string rewritten;
+    size_t lastPos = 0;
+    bool inString = false;
+    for (size_t i = 0; i < code.size(); ++i)
+    {
+        if (code[i] == '"' && (i == 0 || code[i-1] != '\\'))
+            inString = !inString;
+    }
+    // If line has odd/complex quoting just skip predicate-rename inside quotes:
+    std::string masked = code;
+    bool q = false;
+    for (auto &ch : masked) { if (ch=='"') q = !q; else if (q) ch = '\x01'; }
+
+    auto begin = std::sregex_iterator(masked.begin(), masked.end(), predicateCallRegex);
+    auto end = std::sregex_iterator();
+    for (auto it = begin; it != end; ++it)
+    {
+        auto m = *it;
+        rewritten += code.substr(lastPos, m.position(0) - lastPos);
+        std::string suffix = m[2].str() == "?" ? "_q" : "_bang";
+        rewritten += m[1].str() + suffix + (m[3].matched ? m[3].str() : "()");
+        lastPos = m.position(0) + m.length(0);
+    }
+    rewritten += code.substr(lastPos);
+    code = rewritten;
+}
+
+// Ruby-style constructor: ClassName.new(args) -> ClassName(args)
+{
+    static const std::regex newCallRegex(R"(([A-Za-z_]\w*)\.new\()");
+    code = std::regex_replace(code, newCallRegex, "$1(");
+}
+
+        // Ruby string interpolation: "Hello #{name}"
+        {
+            static const std::regex interpolationRegex(
+                R"(^puts\s+["']([^#]*)#\{([^}]*)\}(.*)["']$)"
+            );
+
+            std::smatch m;
+
+            if (std::regex_match(code, m, interpolationRegex))
+            {
+                output << indentation
+                       << "print(\""
+                       << m[1].str()
+                       << "\" + "
+                       << m[2].str()
+                       << " + \""
+                       << m[3].str()
+                       << "\")\n";
+
+                continue;
+            }
         }
 
         // puts(...) and puts expression
@@ -311,6 +402,456 @@ static std::string applyRubyDialect(const std::string &source)
         if (startsWith(code, "puts "))
         {
             output << indentation << "print(" << trimCopy(code.substr(5)) << ")\n";
+            continue;
+        }
+
+        // Ruby input: gets.chomp.to_i
+        if (code.find("gets.chomp.to_i") != std::string::npos)
+        {
+            size_t pos = code.find("gets.chomp.to_i");
+
+            std::string variable =
+                trimCopy(code.substr(0, pos));
+
+            if (variable.back() == '=')
+            {
+                variable.pop_back();
+            }
+
+            output << indentation
+                   << variable
+                   << " = input_int()\n";
+
+            continue;
+        }
+        // Ruby input: gets.chomp.to_i
+if (code.find("gets.chomp.to_i") != std::string::npos)
+{
+    size_t pos = code.find("gets.chomp.to_i");
+    std::string variable = trimCopy(code.substr(0, pos));
+    if (variable.back() == '=')
+    {
+        variable.pop_back();
+    }
+    output << indentation << variable << " = input_int()\n";
+    continue;
+}
+
+// Ruby input: bare gets.chomp (string input, no .to_i)
+if (code.find("gets.chomp") != std::string::npos)
+{
+    size_t pos = code.find("gets.chomp");
+    std::string variable = trimCopy(code.substr(0, pos));
+    if (!variable.empty() && variable.back() == '=')
+    {
+        variable.pop_back();
+        variable = trimCopy(variable);
+    }
+    output << indentation << variable << " = input()\n";
+    continue;
+}
+        // Ruby require
+        if (startsWith(code, "require "))
+        {
+            output << indentation << "// " << code << "\n";
+            continue;
+        }
+
+        // Ruby: raise ExceptionClass, "message"  OR  raise "message"
+{
+    static const std::regex raiseWithClassRegex(R"(^raise\s+\w+\s*,\s*(.+)$)");
+    static const std::regex raiseBareRegex(R"(^raise\s+(.+)$)");
+    std::smatch m;
+    if (std::regex_match(code, m, raiseWithClassRegex))
+    {
+        output << indentation << "throw " << m[1].str() << "\n";
+        continue;
+    }
+    if (std::regex_match(code, m, raiseBareRegex))
+    {
+        output << indentation << "throw " << m[1].str() << "\n";
+        continue;
+    }
+}
+
+        // Ruby: case op ... when "+" then ... / when "-" ... / else ... end
+        // Converted to an if/else-if chain. Each `when` opens a new branch;
+        // `then` on the same line means a single-expression body.
+        if (startsWith(code, "case "))
+{
+    std::string subject = trimCopy(code.substr(5));
+    rubyBlocks.push("CASE|" + subject + "|0"); // 0 = no branch open yet
+    continue;
+}
+if (startsWith(code, "when ") && !rubyBlocks.empty() &&
+    startsWith(rubyBlocks.top(), "CASE|"))
+{
+    std::string top = rubyBlocks.top();
+    size_t p1 = top.find('|');
+    size_t p2 = top.rfind('|');
+    std::string subject = top.substr(p1 + 1, p2 - p1 - 1);
+    bool branchOpen = (top.substr(p2 + 1) == "1");
+
+    std::string rest = trimCopy(code.substr(5));
+    std::string condValue = rest, thenBody;
+    size_t thenPos = rest.find(" then ");
+    if (thenPos != std::string::npos)
+    {
+        condValue = trimCopy(rest.substr(0, thenPos));
+        thenBody = trimCopy(rest.substr(thenPos + 6));
+    }
+
+    if (branchOpen)
+        output << indentation << "}\n";
+
+    output << indentation << "if (" << subject << " == " << condValue << ") {\n";
+    if (!thenBody.empty())
+        output << indentation << "    " << thenBody << "\n";
+
+    rubyBlocks.pop();
+    rubyBlocks.push("CASE|" + subject + "|1");
+    continue;
+}
+if (code == "else" && !rubyBlocks.empty() &&
+    startsWith(rubyBlocks.top(), "CASE|"))
+{
+    std::string top = rubyBlocks.top();
+    output << indentation << "} else {\n";
+    rubyBlocks.pop();
+    // mark as "in else", branch is open, but no further "when" expected
+    size_t p1 = top.find('|');
+    size_t p2 = top.rfind('|');
+    rubyBlocks.push("CASE|" + top.substr(p1 + 1, p2 - p1 - 1) + "|1");
+    continue;
+}
+        if (startsWith(code, "when ") && !rubyBlocks.empty() &&
+            startsWith(rubyBlocks.top(), "case:"))
+        {
+            std::string subject = rubyBlocks.top().substr(5);
+            std::string rest = trimCopy(code.substr(5));
+
+            std::string condValue = rest;
+            std::string thenBody;
+            size_t thenPos = rest.find(" then ");
+            if (thenPos != std::string::npos)
+            {
+                condValue = trimCopy(rest.substr(0, thenPos));
+                thenBody = trimCopy(rest.substr(thenPos + 6));
+            }
+
+            // Are we already inside a when-branch? If so close it first.
+            bool reopening = (rubyBlocks.top() == ("case:" + subject + ":open"));
+            if (reopening)
+            {
+                output << indentation << "}\n";
+                rubyBlocks.pop();
+            }
+
+            output << indentation << "if (" << subject << " == " << condValue << ") {\n";
+            if (!thenBody.empty())
+                output << indentation << "    " << thenBody << "\n";
+
+            rubyBlocks.pop();
+            rubyBlocks.push("case:" + subject + ":open");
+            continue;
+        }
+        if (code == "else" && !rubyBlocks.empty() &&
+            endsWith(rubyBlocks.top(), ":open") &&
+            startsWith(rubyBlocks.top(), "case:"))
+        {
+            std::string subject = rubyBlocks.top();
+            subject = subject.substr(5, subject.size() - 5 - 5); // strip "case:" and ":open"
+            output << indentation << "} else {\n";
+            rubyBlocks.pop();
+            rubyBlocks.push("case:" + subject + ":inelse");
+            continue;
+        }
+
+        // Ruby: 5.times do |i|
+        {
+            static const std::regex timesRegex(
+                R"(^(\S+)\.times\s+do\s*\|\s*([A-Za-z_]\w*)\s*\|\s*$)");
+
+            std::smatch m;
+            if (std::regex_match(code, m, timesRegex))
+            {
+                output << indentation
+                       << "for " << m[2].str()
+                       << " in range(" << m[1].str() << ")\n{\n";
+
+                rubyBlocks.push("times");
+                continue;
+            }
+        }
+        // Ruby range each: (1..100).each do |n|
+        {
+            static const std::regex rangeEachRegex(
+                R"(^\(\s*(.+)\.\.(.+)\s*\)\.each\s+do\s*\|\s*([A-Za-z_]\w*)\s*\|\s*$)");
+
+            std::smatch m;
+
+            if (std::regex_match(code, m, rangeEachRegex))
+            {
+                output << indentation
+                       << "for (let "
+                       << m[3].str()
+                       << " = "
+                       << m[1].str()
+                       << "; "
+                       << m[3].str()
+                       << " <= "
+                       << m[2].str()
+                       << "; "
+                       << m[3].str()
+                       << "++) {\n";
+
+                rubyBlocks.push("each");
+                continue;
+            }
+        }
+
+        // Ruby: arr.each_with_index do |x, i|
+        {
+            static const std::regex eachIndexRegex(
+                R"(^(.+)\.each_with_index\s+do\s*\|\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\|\s*$)");
+
+            std::smatch m;
+            if (std::regex_match(code, m, eachIndexRegex))
+            {
+                output << indentation
+                       << "for " << m[3].str()
+                       << ", " << m[2].str()
+                       << " in enumerate(" << trimCopy(m[1].str()) << ")"
+                       << "\n{\n";
+
+                rubyBlocks.push("each_with_index");
+                continue;
+            }
+        }
+
+        // Ruby: collection.each do |x|
+        {
+            static const std::regex eachRegex(
+                R"(^(.+)\.each\s+do\s*\|\s*([A-Za-z_]\w*)\s*\|\s*$)");
+
+            std::smatch m;
+            if (std::regex_match(code, m, eachRegex))
+            {
+                output << indentation
+                       << "for " << m[2].str()
+                       << " in " << trimCopy(m[1].str())
+                       << "\n{\n";
+
+                rubyBlocks.push("each");
+                continue;
+            }
+        }
+{
+    static const std::regex genericDoRegex(
+        R"(^(.+?)\s+do\s*\|\s*([A-Za-z_]\w*)\s*\|\s*$)");
+    std::smatch m;
+    if (std::regex_match(code, m, genericDoRegex))
+    {
+        output << indentation << "for " << m[2].str()
+               << " in [" << trimCopy(m[1].str()) << "]\n{\n";
+        rubyBlocks.push("each");
+        continue;
+    }
+}
+        // Ruby: (2..n).each { |i| statement }
+        {
+            static const std::regex rangeInlineEachRegex(
+                R"(^\(\s*(.+)\.\.(.+)\s*\)\.each\s*\{\s*\|\s*([A-Za-z_]\w*)\s*\|\s*(.+)\s*\}$)"
+            );
+
+            std::smatch m;
+
+            if (std::regex_match(code, m, rangeInlineEachRegex))
+            {
+                output << indentation
+                       << "for (let "
+                       << m[3].str()
+                       << " = "
+                       << m[1].str()
+                       << "; "
+                       << m[3].str()
+                       << " <= "
+                       << m[2].str()
+                       << "; "
+                       << m[3].str()
+                       << "++) {\n";
+
+                output << indentation
+                       << "    "
+                       << m[4].str()
+                       << "\n";
+
+                output << indentation << "}\n";
+
+                continue;
+            }
+        }
+
+        // Ruby: (2..n).each { |i| result *= i }
+        {
+            static const std::regex eachInlineRegex(
+                R"(^(.+)\.each\s*\{\s*\|\s*([A-Za-z_]\w*)\s*\|\s*(.+)\s*\}$)");
+
+            std::smatch m;
+
+            if (std::regex_match(code, m, eachInlineRegex))
+            {
+                output << indentation
+                       << "for (let "
+                       << m[2].str()
+                       << " in "
+                       << trimCopy(m[1].str())
+                       << ") {\n";
+
+                output << indentation
+                       << "    "
+                       << m[3].str()
+                       << "\n";
+
+                output << indentation << "}\n";
+
+                continue;
+            }
+        }
+
+        // Only rewrite bare `.each { |x| ... }` as a loop — leave
+// .none?/.any?/.all?/.select/.map/.find/.reject alone; they are
+// expressions, not loops, and must stay as method calls.
+{
+    static const std::regex genericInlineBlockRegex(
+        R"(^(.+)\.each\s*\{\s*\|\s*([A-Za-z_]\w*)\s*\|\s*(.+)\s*\}\s*$)");
+    std::smatch m;
+    if (std::regex_match(code, m, genericInlineBlockRegex))
+    {
+        output << indentation << "for " << m[2].str() << " in " << trimCopy(m[1].str()) << " {\n";
+        output << indentation << "    " << m[3].str() << "\n";
+        output << indentation << "}\n";
+        continue;
+    }
+}
+
+        {
+            static const std::regex timesNoVar(
+                R"(^(\S+)\.times\s+do\s*$)");
+
+            std::smatch m;
+            if (std::regex_match(code, m, timesNoVar))
+            {
+                output << indentation
+                       << "for _ in range(" << m[1].str() << ")\n{\n";
+
+                rubyBlocks.push("times");
+                continue;
+            }
+        }
+
+        // Ruby: bare `loop do` (infinite loop, no receiver)
+        if (code == "loop do")
+        {
+            output << indentation << "while (true) {\n";
+            rubyBlocks.push("loop");
+            continue;
+        }
+
+        // Ruby: a.upto(b) do / a.upto(b) do |i|
+        if (code.find(".upto(") != std::string::npos &&
+            code.find("do") != std::string::npos)
+        {
+            size_t dot = code.find(".upto(");
+
+            std::string start =
+                trimCopy(code.substr(0, dot));
+
+            size_t lp = code.find('(', dot);
+            size_t rp = code.find(')', lp);
+
+            std::string finish =
+                trimCopy(code.substr(lp + 1,
+                                     rp - lp - 1));
+
+            std::string var = "__i";
+
+            size_t p1 = code.find('|');
+            size_t p2 = code.find('|', p1 + 1);
+
+            if (p1 != std::string::npos &&
+                p2 != std::string::npos)
+            {
+                var = trimCopy(
+                    code.substr(p1 + 1,
+                                p2 - p1 - 1));
+            }
+
+            output << indentation
+                   << "for (let "
+                   << var
+                   << " = "
+                   << start
+                   << "; "
+                   << var
+                   << " <= "
+                   << finish
+                   << "; "
+                   << var
+                   << "++) {\n";
+
+            continue;
+        }
+
+        // Ruby: a.downto(b) do / a.downto(b) do |i|
+        if (code.find(".downto(") != std::string::npos &&
+            code.find("do") != std::string::npos)
+        {
+            size_t dot = code.find(".downto(");
+
+            std::string start =
+                trimCopy(code.substr(0, dot));
+
+            size_t lp = code.find('(', dot);
+            size_t rp = code.find(')', lp);
+
+            std::string finish =
+                trimCopy(code.substr(lp + 1,
+                                     rp - lp - 1));
+
+            std::string var = "__i";
+
+            size_t p1 = code.find('|');
+            size_t p2 = code.find('|', p1 + 1);
+
+            if (p1 != std::string::npos &&
+                p2 != std::string::npos)
+            {
+                var = trimCopy(
+                    code.substr(p1 + 1,
+                                p2 - p1 - 1));
+            }
+
+            output << indentation
+                   << "for (let "
+                   << var
+                   << " = "
+                   << start
+                   << "; "
+                   << var
+                   << " >= "
+                   << finish
+                   << "; "
+                   << var
+                   << "--) {\n";
+
+            continue;
+        }
+
+        // Ruby include
+        if (startsWith(code, "include "))
+        {
+            output << indentation << "// " << code << "\n";
             continue;
         }
 
@@ -332,22 +873,120 @@ static std::string applyRubyDialect(const std::string &source)
             output << indentation << "} else {\n";
             continue;
         }
-        if (code == "end")
+
+        // Ruby modifier if: statement if condition
         {
-            output << indentation << "}\n";
-            continue;
+            static const std::regex modifierIfRegex(
+                R"(^(.+)\s+if\s+(.+)$)"
+            );
+
+            std::smatch m;
+
+            if (std::regex_match(code, m, modifierIfRegex))
+            {
+                output << indentation
+                       << "if ("
+                       << trimCopy(m[2].str())
+                       << ") {\n";
+
+                output << indentation
+                       << "    "
+                       << trimCopy(m[1].str())
+                       << "\n";
+
+                output << indentation
+                       << "}\n";
+
+                continue;
+            }
         }
 
+        // Ruby modifier unless: statement unless condition
+        {
+            static const std::regex modifierUnlessRegex(
+                R"(^(.+)\s+unless\s+(.+)$)"
+            );
+
+            std::smatch m;
+
+            if (std::regex_match(code, m, modifierUnlessRegex))
+            {
+                output << indentation
+                       << "if (!("
+                       << trimCopy(m[2].str())
+                       << ")) {\n";
+
+                output << indentation
+                       << "    "
+                       << trimCopy(m[1].str())
+                       << "\n";
+
+                output << indentation
+                       << "}\n";
+
+                continue;
+            }
+        }
+
+        // Ruby: begin
+        if (code == "begin")
+{
+    // VM has no try/catch support — begin becomes a no-op marker
+    rubyBlocks.push("begin");
+    continue;
+}
+
+        // Ruby: rescue StandardError => e  /  rescue => e  /  bare rescue
+        if (startsWith(code, "rescue"))
+{
+    output << indentation << "// rescue clause skipped (VM has no exception handling): " << code << "\n";
+    rubyBlocks.push("rescue_dead");
+    continue;
+}
+ if (code == "end")
+{
+    if (!rubyBlocks.empty())
+    {
+        std::string top = rubyBlocks.top();
+        rubyBlocks.pop();
+        if (top == "begin" || top == "rescue_dead")
+            continue;
+        if (startsWith(top, "CASE|"))
+        {
+            if (top.back() == '1')
+                output << indentation << "}\n";
+            continue;
+        }
+    }
+    output << indentation << "}\n";
+    continue;
+}
         if (startsWith(code, "unless "))
         {
-            output << indentation << "if (!("
-                   << trimCopy(code.substr(7)) << ")) {\n";
+            std::string condition = trimCopy(code.substr(7));
+
+            if (endsWith(condition, " then"))
+                condition = trimCopy(condition.substr(0, condition.size() - 5));
+
+            output << indentation
+                   << "if (!("
+                   << condition
+                   << ")) {\n";
+
             continue;
         }
         if (startsWith(code, "if "))
         {
-            output << indentation << "if ("
-                   << trimCopy(code.substr(3)) << ") {\n";
+            std::string condition = trimCopy(code.substr(3));
+
+            if (endsWith(condition, " then"))
+                condition = trimCopy(condition.substr(0, condition.size() - 5));
+
+            output << indentation
+                   << "if ("
+                   << condition
+                   << ") {\n";
+
             continue;
         }
 
@@ -364,11 +1003,118 @@ static std::string applyRubyDialect(const std::string &source)
             continue;
         }
 
+        // Ruby: redo
+        if (code == "redo")
+        {
+            output << indentation << "continue;\n";
+            continue;
+        }
+        // Ruby: puts
+        if (code == "puts")
+        {
+            output << indentation << "print()\n";
+            continue;
+        }
+
+        // Ruby: print
+        if (code == "print")
+        {
+            output << indentation << "print()\n";
+            continue;
+        }
+        // Ruby: next
+        if (code == "next")
+        {
+            output << indentation << "continue;\n";
+            continue;
+        }
+
+        // Ruby: retry
+        if (code == "retry")
+        {
+            output << indentation << "continue;\n";
+            continue;
+        }
+        // Ruby: break
+        if (code == "break")
+        {
+            output << indentation << "break;\n";
+            continue;
+        }
+        // Ruby module
+        if (startsWith(code, "module "))
+        {
+            std::string moduleName = trimCopy(code.substr(7));
+            output << indentation << "namespace " << moduleName << " {\n";
+            continue;
+        }
+
+        if (startsWith(code, "attr_reader ") || startsWith(code, "attr_accessor ") || startsWith(code, "attr_writer "))
+{
+    std::string rest = code.substr(code.find(' ') + 1);
+    std::istringstream names(rest);
+    std::string tok;
+    while (std::getline(names, tok, ','))
+    {
+        tok = trimCopy(tok);
+        if (!tok.empty() && tok[0] == ':')
+            tok = tok.substr(1);
+        output << indentation << "// attr: " << tok << "\n";
+    }
+    continue;
+}
+        {
+    static const std::regex classRegex(R"(^class\s+([A-Za-z_]\w*)(\s*<\s*([A-Za-z_]\w*))?\s*$)");
+    std::smatch m;
+    if (std::regex_match(code, m, classRegex))
+    {
+        output << indentation << "class " << m[1].str();
+        if (m[3].matched)
+            output << " : " << m[3].str();   // adjust to your parser's inheritance syntax
+        output << " {\n";
+        rubyBlocks.push("class");
+        continue;
+    }
+}
+
         if (startsWith(code, "def "))
         {
             std::string signature = trimCopy(code.substr(4));
+
+            // predicate/bang names already renamed above (name_q / name_bang)
+            // by the time we get here, so just ensure zero-arg defs get "()"
+            if (signature.find('(') == std::string::npos)
+            {
+                // signature is a bare name (possibly with trailing junk) —
+                // take the identifier and add empty parens.
+                static const std::regex bareNameRegex(R"(^([A-Za-z_]\w*)\s*$)");
+                std::smatch m;
+                if (std::regex_match(signature, m, bareNameRegex))
+                    signature = m[1].str() + "()";
+            }
+
             output << indentation << "function " << signature << " {\n";
+            rubyBlocks.push("def");
             continue;
+        }
+
+
+        // Ruby member methods
+        {
+            static const std::regex lengthRegex(
+                R"(^(\S+)\.(length|size)$)"
+            );
+
+            std::smatch m;
+
+            if (std::regex_match(code, m, lengthRegex))
+            {
+                output << indentation
+                       << "len("
+                       << trimCopy(m[1].str())
+                       << ")\n";
+                continue;
+            }
         }
 
         // Common Ruby literals mapped to the Quantum common representation.
@@ -380,7 +1126,6 @@ static std::string applyRubyDialect(const std::string &source)
 
     return output.str();
 }
-
 // C/C++ programs only define main() — append a call so the program executes
 // after its top-level declarations load. Ruby files are first normalized into
 // the common Quantum syntax and then use the normal compiler/VM pipeline.
