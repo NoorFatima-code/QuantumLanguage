@@ -237,6 +237,25 @@ void VM::runFrame(size_t stopDepth)
         case Op::BIT_OR:
         case Op::BIT_XOR:
         case Op::LSHIFT:
+        {
+            QuantumValue R = pop(), L = pop();
+            // C++ stream insertion: fileObj << value → write to the file.
+            // A file object is a Dict carrying a "write" native. If L is one,
+            // write R's text and push L back so f << a << b chains.
+            if (L.isDict())
+            {
+                auto d = L.asDict();
+                auto it = d->find("write");
+                if (it != d->end() && it->second.isNative())
+                {
+                    it->second.asNative()->fn({ R });
+                    push(L);
+                    break;
+                }
+            }
+            push(execBinary(instr.op, L, R, line));
+            break;
+        }
         case Op::RSHIFT:
         case Op::EQ:
         case Op::NEQ:
@@ -1022,6 +1041,12 @@ void VM::runFrame(size_t stopDepth)
         case Op::ARROW:
         {
             // ptr->member: handled by compileArrow as DEREF + GET_MEMBER
+            QuantumValue val = pop();
+            if (val.isPointer()){
+                push(val.asPointer()->deref());
+            }else{
+                push(val);
+            }
             break;
         }
 
